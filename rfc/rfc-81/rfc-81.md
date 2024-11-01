@@ -14,7 +14,7 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 -->
-# RFC-81: Log Compaction with Merge Sort
+# RFC-81: Hudi Data Ordering
 
 ## Proposers
 - @usberkeley
@@ -26,57 +26,71 @@
 JIRA: https://issues.apache.org/jira/browse/HUDI-8033
 
 ## Abstract
-Add lightweight LogCompaction to improve the writing performance of the write side, and improve the query performance of the read side (Spark/Presto, etc.) in some scenarios without having to wait for heavy and time-consuming operations such as Compaction or Clustering.
+This RFC introduces the functionality of sorting log blocks and base files, allowing records to be sorted by primary key. 
+This enables a merge-sort based read API and compaction to improve read and write performance. It mainly includes two modules:
+
+1. Merge-sort based compaction
+2. Merge-sort based scanner
+Additionally, this RFC will assist Hudi MDT in building a primary key index similar to ClickHouse, providing multi-dimensional analysis capabilities for the read side.
 
 ## Background
-The previous LogCompaction mainly merged log files through HoodieMergedLogRecordScanner, and used ExternalSpillableMap internally to achieve record merging, which resulted in performance loss of writing to disk, when the amount of log data exceeds merge memory available.
-LogCompaction with Merge Sort is introduced to achieve lightweight minor compaction by merging records through N-way streaming of ordered data, thus improving the writing performance of the write side. At the same time, thanks to the ordered data, the query performance on the read side can be improved when the primary key is met.
+Currently, the unordered nature of Hudi data affects data processing and read efficiency. During data compaction and when reading data through Spark and Trino, an ExternalSpillableMap is needed to merge records. 
+This lack of order also reduces the efficiency of predicate pushdown on the read side.
+
+### Compaction and Reader (Spark/Trino) Reading Process
+During compaction and when a reader reads a Hudi table, concurrent tasks are divided based on file groups. Each task reads the base file and incremental log files of the file group. 
+These records are stored in an ExternalSpillableMap, and if duplicate primary keys exist, record merging is required.
+
+### Relationship Between Data Order and Read Efficiency
+When Parquet data is ordered, the page statistics are more accurate and effective. Because the data is sorted by a certain key, the minimum and maximum values of the pages can better define the data range. 
+Readers can use this information to determine which pages do not contain the required data and skip them. 
+This optimization requires that the reader's predicate is one of the composite primary key dimension columns.
+
+### Relationship Between Data Order and Storage Size
+Ordered Parquet data makes RLE encoding more efficient. By clustering similar or repeated data, the size of data files can be significantly reduced. 
+Reducing the size of base files also improves the efficiency of reading them.
+Take the example of a loan transaction table for testing, where the primary key dimensions are user_id and an auto-generated id. 
+Each user has an average of 15 records. After sorting, the storage space is reduced by 23.08%, and if scanning the files, the read volume can also be reduced by 23.08% (improving read efficiency).
+
+### Merge Sort Based Merger
+After sorting the data, we introduce a merge-sort based merger, changing the original compaction and file group reading process into a streaming process. 
+The specific steps are as follows:
+
+1. Construct a min-heap, where the nodes consist of input streams from base file or log blocks in log files. Pre-read 10MB of records from each input stream into a buffer.
+2. Traverse the min-heap and merge records with the same primary key.
+3. When a heap node's buffer is empty, read the next 10MB of records from the input stream to refill the buffer until reaching the end of the file. 
+   If the end of the file is reached, remove the node from the min-heap.
+
+Since the merge-sort based merger is streaming and memory-friendly, it eliminates the need for intermediate storage, addressing some issues caused by the ExternalSpillableMap:
+1. Reduces IO overhead caused by memory overflow.
+2. Avoids excessive memory usage that can occur when increasing maximum memory size to reduce IO overhead, which is correlated with the number of file groups.
+
+Note: [Log Block Streaming Read PR](https://github.com/apache/hudi/pull/11924#issuecomment-2343958178)
 
 ## Implementation
-### Common Configuration
-- Add a new configuration item for the HoodieLogBlock streaming read buffer size. The default value is 10MB.
-- Add a new configuration item for whether to enable MergeSort in LogCompaction. The default value for Flink is true, while the default value for Spark is false.
-### Flink
-- Add a new configuration item to enable LogCompaction. The default value is false.
-### Important Note
-1. LogCompaction with Merge Sort only supports AVRO log format. After LogCompaction turns on MergeSort, we need to check whether the hoodie.logfile.data.block.format configuration item is correct.
-2. After enabling MergeSort in LogCompaction, it does not guarantee that LogCompaction will necessarily use Merge Sort based merger. If it is found during execution that the IS_ORDERED in a LogBlock header is false (indicating that the LogBlock data is unordered), it will fall back to the default map-based merger.
+### Base
+#### Parameter Configuration
+- `compaction_log_streaming_read_buffer`: The default value is 10MB.
+- `compaction_with_merge_sort_enable`: The default value is false.
 
-### LogBlock Header
-- HeaderMetadataType: Add a new enumeration type: IS_ORDERED, indicating whether the data in the LogBlock is ordered. The default value is false.
+#### Log Block Header
+- IS_ORDERED: Indicating whether the data in the LogBlock is ordered. The default value is false.
 
-### DeltaCommit
-When LogCompaction turns on MergeSort, DeltaCommit sorts the written data by RecordKey to achieve orderly records in LogBlock, and sets the LogBlock header's IS_ORDERED to true.
+#### Merge Sort Based Scanner
+Scan base and log files in a file group and return an iterator of merged records. Typically invoked by readers like Spark/Trino and during compaction.
+The scanner maintains a min-heap internally, where each node contains an input stream from a base or log blocks in log files, along with a corresponding record queue buffer. 
+When building the heap, the node's input stream initially reads 10MB of record into the buffer. During heap adjustments, the node's priority is determined by the head record of the queue buffer.
+Finally, the scanner iterator retrieves the top record from the min-heap, merges records with the same key, and returns the merged, primary-key-sorted records.
 
-### LogCompaction
-The following contents are all about enabling MergeSort with LogCompaction.
-#### Flink
-Flink has not yet fully implemented the LogCompaction feature, so the operator needs to be implemented:
-1. LogCompactionPlanOperator
-2. LogCompactionOperator
-3. LogCompactionCommitSink
-#### Spark & Flink
-Considering that when enabling LogCompaction with Merge Sort on the historical table or when multiple writers are involved and one of the writer does not enable Merge Sort, it may result in some LogBlock data being unordered and not meeting the conditions for executing MergeSort.
-Therefore, during the execution of the LogCompaction Operation, the HoodieUnMergedLogRecordScanner with skipProcessingBlocks will be used to check the IS_ORDERED header of all LogBlock files in that Operation. If the data within any LogBlocks is not ordered, it will fall back to the map-based merger, HoodieMergedLogRecordScanner.
-Otherwise, use the new log scanner: HoodieMergeSortLogRecordScanner to achieve N-way streaming record merging.
+### Delta Commit
+When `compaction_with_merge_sort_enable` is true, DeltaCommit sorts the written data by RecordKey to achieve orderly records in LogBlock, and sets the LogBlock header's IS_ORDERED to true.
 
-Additionally, we do not check the IS_ORDERED flag in the LogBlock header during the LogCompaction scheduling plan phase to determine the scanner type. The main concern is that new LogBlocks might be added to the log file before the operation execution, and these new LogBlocks would not have had their headers checked for the IS_ORDERED flag, posing a risk.
-By checking the IS_ORDERED flag in the header during the operation execution phase, we only incur a minimal performance cost from reading a small amount of header information. This approach completely avoids the complex design required to maintain consistent scanning ranges between the scheduling plan and the operation execution phases.
-
-### HoodieMergeSortLogRecordScanner
-Implement a min-heap. The heap node is a HoodieLogBlock object. The heap node comparison uses HoodieRecord#RecrodKey.
-When traversing the scanner record iterator, return to the top node of the heap and call the HoodieLogBlock object to return the record.
-
-### HoodieDataBlock
-Add a new streaming read abstract method to help HoodieMergeSortLogRecordScanner avoid OOM when reading N LogBlocks.
-1. HoodieAvroDataBlock: Implements the streaming read member function. Internally, it gradually reads small parts of the log file into the buffer to implement streaming decoding of AVRO records. When the buffer is insufficient, it triggers the reading of the log file. 
-The buffer size can be adjusted by the configuration item.
-2. HFile/Parquet: To be implemented in the future.
+### Compaction
+Iterate over the record iterator returned by the merge-sort based scanner and write to the base file.
 
 ## Rollout/Adoption Plan
 - What impact (if any) will there be on existing users?
-1. Flink: Since Flink did not have LogCompaction before, enabling LogCompaction may reduce write performance, which requires performance testing to determine if there is an impact and the extent of the impact.
-2. Spark: None
+  None
 - If we are changing behavior how will we phase out the older behavior?
   None
 - If we need special migration tools, describe them here.
@@ -84,39 +98,60 @@ The buffer size can be adjusted by the configuration item.
 - When will we remove the existing behavior.
   None
 
-## Local Performance Test Results
-### Conditions
-1. Machine Configuration and Environment: 7 vCore & 36GB, Flink 1.5, Hudi 0.15
-2. Table Configuration: Flink MOR with Bucket; Compaction disabled, only LogCompaction enabled; Flink Checkpoint Interval 60s
-3. Data Volume: 350GB added daily (AVRO format)
+## Performance Test Results
+### Compaction
+Flink MOR table, 7 VCore, 36 GB memory, flink checkpoint 10min, other configurations remain default.
 
-### Comparison Objects
-- Table A: LogCompaction with Map-Based Merger
-- Table B: LogCompaction with MergeSort-Based Merger
+| Type                        | Kafka Fully Consumed | Runtime | Records Consumed | Record Size   |
+|-----------------------------|----------------------|---------|------------------|---------------|
+| Map-based compaction        | No                   | 11.5h   | 226,250,649      | 752 GB        |
+| Merge-sort based compaction | No                   | 11.5h   | 260,188,246      | 858 GB        |
 
-### Results
-After running for seven days, Sampling statistics, the average data freshness for Table A and Table B:
-- Table A: 55 minutes
-- Table B: 25 minutes
+### Log Compaction
+Flink MOR table, 7 VCore, 36 GB memory, flink checkpoint 10min, other configurations remain default.
+
+| Type                            | Kafka Fully Consumed | Runtime | Records Consumed | Record Size   |
+|---------------------------------|----------------------|---------|------------------|---------------|
+| Map-based log compaction        | No                   | 11.5h   | 147,995,817      | 494 GB        |
+| Merge-sort based log compaction | No                   | 11.5h   | 170,726,805      | 573 GB        |
+
+Noted:
+1. Delta Commit + Log Compaction: This approach has no advantage. Log Compaction is slower than Compaction because the log data grows significantly, leading to increased read times for log files. 
+   Log Compaction operates in append mode, which increases the log size with each execution. Additionally, AVRO files are five times larger than Parquet files in our test table.
+2. Delta Commit + Compaction + Log Compaction: Log Compaction to merge Log Block fragments in order to improve the query speed for Readers, while test results show no significant impact on write performance consumption.
+   This RFC does not include Log Compaction, because it primarily supports the MDT primary key index, so it is recommended to include it in the new RFC for the MDT primary key index.
+   Reference [Balancing compute cost and query performance](https://docs.google.com/presentation/d/10hHkQsd0bCdCor4w9Wduds5l-i_Z7X7A-zk_vYYi4kA/edit#slide=id.p18)
+
+### Sparse Index for MDT Primary Key
+This RFC does not involve building a primary key index for MDT, but we provide query performance test results for the primary key index:
+
+1. The Parquet file size of the test table is 2TB. Indexing is only generated for Parquet files, not for AVRO logs. A self-developed query engine is used for indexing queries on Hudi.
+
+| QPS | Success Rate | P99 Query Time (seconds) | Average Data Freshness (minutes) |
+|-----|--------------|--------------------------|----------------------------------|
+| 1   | 100%         | 2.2                      | 40                               |
+| 10  | 100%         | 2.5                      | 40                               |
+| 30  | 100%         | 3.0                      | 40                               |
+
+2. The Parquet file size of the test table is 2TB. Primary key indexes are generated for both Parquet files and AVRO logs. A self-developed query engine is used for indexing queries on Hudi.
+
+| QPS | Success Rate | P99 Query Time (seconds) | Average Data Freshness (minutes) |
+|-----|--------------|--------------------------|----------------------------------|
+| 1   | 100%         | 3.5                      | 7                                |
+| 10  | 100%         | 4.3                      | 7                                |
+| 30  | 100%         | 5.0                      | 7                                |
 
 ## Test Plan
-### HoodieConfig etc
-Check whether the configuration items are correct and whether the dependent configuration items are correct.
+
+### Merge Sort Based Scanner
+1. Data Order Verification
+2. Correctness of Data Deduplication and Merging
+3. Boundary Condition Verification
 
 ### DeltaCommit
-Check if the incremental LogBlock is ordered by RecordKey.
+1. Data Order Verification
 
-### LogCompaction
-#### Flink
-1. Check whether the logic of LogCompactionPlanOperator/LogCompactionOperator/LogCompactionCommitSink operators is correct.
-2. Integration test to check whether the results are successfully deduplicated.
-3. When some LogBlock data is unordered (i.e., the IS_ORDERED in the LogBlock header is false), check whether the results are successfully deduplicated.
-#### Spark
-1. Integration test to check whether the results are successfully deduplicated.
-2. When some LogBlock data is unordered (i.e., the IS_ORDERED in the LogBlock header is false), check whether the results are successfully deduplicated.
-### HoodieMergeSortLogRecordScanner
-1. Check whether the logic of the min-heap is correct (construction/reading/number of heap nodes).
-2. Check whether the records returned by the scanner are in order by RecordKey.
-
-### HoodieDataBlock
-Check whether the streaming read logic is correct (decoding AVRO/buffer).
+### Compaction
+1. Data Order Verification
+2. Correctness of Data Deduplication and Merging
+3. Boundary Condition Verification
